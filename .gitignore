@@ -1,0 +1,40 @@
+# ============================================================
+# N.E.S.T. — .gitignore
+# ============================================================
+
+# Virtual environment (the nest/ folder)
+nest/
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Video files (input & output — too large for git)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# JSON output logs produced at runtime
+*_action_log.json
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/

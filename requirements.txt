@@ -1,0 +1,51 @@
+# ============================================================
+# Requirements for mediapipe_inference.py
+# Install with:  pip install -r requirements.txt
+# ============================================================
+
+# Deep learning core
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Object detection & tracking
+ultralytics>=8.0.0
+
+# Person Re-ID library (BoT-SORT feature backbone)
+torchreid
+
+# Computer vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+
+# Pose estimation
+mediapipe>=0.10.0
+
+# Scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Filtering & signal processing
+filterpy>=1.4.5
+
+# Visualisation utilities
+matplotlib>=3.7.0
+Pillow>=9.5.0
+
+# Data handling / display utilities
+pandas>=1.5.0
+gdown
+# ============================================================
+# Model file download (run once manually):
+#
+#   wget -q -O pose_landmarker_heavy.task \
+#     https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task
+#
+# Or using Python:
+#   import urllib.request
+#   urllib.request.urlretrieve(
+#       "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+#       "pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task",
+#       "pose_landmarker_heavy.task"
+#   )
+# ============================================================
