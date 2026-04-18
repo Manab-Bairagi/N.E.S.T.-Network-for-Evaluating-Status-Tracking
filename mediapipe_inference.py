@@ -952,8 +952,8 @@ CHANGED (3D upgrade):
   is unchanged.
 """
 
-CONFIDENCE_THRESHOLD = 0.25
-SOFTMAX_TEMP         = 1.1
+CONFIDENCE_THRESHOLD = 0.10
+SOFTMAX_TEMP         = 1.0
 
 
 def split_sample(tensor):
@@ -1323,15 +1323,16 @@ def process_video_with_action_recognition(
         vis_frame = draw_trajectories(vis_frame, tracker)
         out_writer.write(vis_frame)
 
-        # Step 6: JSON logging — record this frame's state
-        action_logger.log_event(
-            frame_idx       = frame_idx,
-            fps             = fps,
-            tracks_dict     = tracks_dict,
-            action_labels   = action_labels,
-            active_pairs    = active_pairs,
-            track_kpts_norm = track_kpts_norm,
-        )
+        # Step 6: JSON logging — record state ONLY once per second
+        if fps > 0 and frame_idx % fps == 0:
+            action_logger.log_event(
+                frame_idx       = frame_idx,
+                fps             = fps,
+                tracks_dict     = tracks_dict,
+                action_labels   = action_labels,
+                active_pairs    = active_pairs,
+                track_kpts_norm = track_kpts_norm,
+            )
 
         if frame_idx % 30 == 0: print(f"  Frame {frame_idx}/{tot_frames} | Tracks: {len(tracks_dict)}")
         frame_idx += 1
@@ -1646,10 +1647,10 @@ Example JSON output path: output_action_log.json  (auto-derived from output_path
 Track._count = 0
 
 output, top5_action_log, action_logger = process_video_with_action_recognition(
-    video_path      = 'water.mp4',              # <-- update to your video file path
+    video_path      = 'anurag.mp4',              # <-- update to your video file path
     output_path     = 'output_action.mp4',
     reid_model_path = 'best_model.pth',         # tracker ReID weights
-    conf_threshold  = 0.3,
+    conf_threshold  = 0.5,
     max_frames      = None,        # set e.g. 300 for a quick test
     buffer_len      = 60,          # temporal window (frames)
     bbox_scale      = 1.5,         # expand boxes before pose crop
