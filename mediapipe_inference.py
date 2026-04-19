@@ -2,6 +2,13 @@
 """MediaPipe_inference.py
 
 Action recognition inference pipeline using MediaPipe + EfficientGCN-B0.
+
+Aligned to the 15-channel training architecture (3degcn_mediapipe_robust.py):
+  - Spine-length normalization replaces max-abs scaling.
+  - bone_len channel removed. Bone stream is now 3 channels (dx, dy, dz).
+  - Total feature channels: 6 (joint) + 6 (velocity) + 3 (bone) = 15.
+  - Tensor split updated to reflect 15-channel layout.
+  - EfficientGCN_B0.init_bone updated to in_ch=3.
 """
 
 # ============================================================================
@@ -12,21 +19,6 @@ All dependencies are listed in requirements.txt.
 Install with:
 
     pip install -r requirements.txt
-
-For GPU (CUDA 11.8), install PyTorch separately first:
-
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-Also download the MediaPipe Tasks pose model once:
-
-    python -c "
-    import urllib.request
-    urllib.request.urlretrieve(
-        'https://storage.googleapis.com/mediapipe-models/pose_landmarker/'
-        'pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task',
-        'pose_landmarker_heavy.task'
-    ); print('Downloaded pose_landmarker_heavy.task')
-    "
 """
 
 print("✓ Cell 1: See requirements.txt for installation instructions.")
@@ -42,16 +34,12 @@ then run. This imports everything from the tracker WITHOUT modifying it.
 
 import importlib, sys, os
 
-# Ensure the script's own directory is on the path so that
-# customtrackerfinal.py can be found when running from any cwd.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-# We import the tracker module as-is (zero modifications)
 import customtrackerfinal as tracker_module
 
-# Pull the classes/functions we need from the tracker
 from customtrackerfinal import (
     EnhancedFeatureExtractor,
     MemoryEnhancedBoTSORT,
@@ -70,10 +58,7 @@ import math
 import warnings
 warnings.filterwarnings('ignore')
 
-# CHANGED: Import YOLO for detection only (no more YOLO-Pose)
 from ultralytics import YOLO
-
-# CHANGED: Import MediaPipe for skeleton extraction
 import mediapipe as mp
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -81,21 +66,23 @@ print(f"✓ Tracker imported successfully | Device: {device}")
 
 
 # ============================================================================
-# CELL 3: Action Model Architecture (EfficientGCN-B0 — 3D)
+# CELL 3: Action Model Architecture (EfficientGCN-B0 — 3D, 15-channel)
 # ============================================================================
 """
-CHANGED (3D upgrade):
-  - INPUT_DIM updated to 3 to reflect (X, Y, Z) coordinates from NTU RGB+D.
+CHANGED (15-channel alignment):
   - EfficientGCN_B0.__init__ updated so that the three InitialBlocks receive
-    the correct number of input channels that correspond to the 3D feature
-    streams produced by generate_features_from_sequence:
+    the correct number of input channels matching the 15-channel feature layout:
         init_joint    : in_ch = 6  (abs_x, abs_y, abs_z, rel_x, rel_y, rel_z)
         init_velocity : in_ch = 6  (fast_x, fast_y, fast_z, slow_x, slow_y, slow_z)
-        init_bone     : in_ch = 4  (bone_dx, bone_dy, bone_dz, bone_len)
-    Total input channels = 6 + 6 + 4 = 16.
+        init_bone     : in_ch = 3  (bone_dx, bone_dy, bone_dz)   ← was 4
+    Total input channels = 6 + 6 + 3 = 15.
+  - bone_len channel removed. The bone stream no longer includes it because
+    MediaPipe scales depth proportionally to the 2D bounding box width,
+    causing bone lengths to artificially stretch and shrink with camera
+    distance — a corrupt feature the model must not learn.
   - The forward() docstring updated accordingly.
-  - All other architecture code (graph, layers, attention) is identical to the
-    training script and must NOT be modified.
+  - All other architecture code (graph, layers, attention) is identical to
+    the training script and must NOT be modified.
 """
 
 # ---- NTU action class list (45 classes used during training) ----
@@ -140,13 +127,18 @@ LABEL_NAMES = {
 NUM_JOINTS      = 25
 MAX_PERSONS     = 2
 MAX_FRAMES      = 90
-INPUT_DIM       = 3        # CHANGED: (x, y, z) — 3D coordinates from NTU RGB+D
+INPUT_DIM       = 3
 SGLayer_RRD     = 2
 TEMPORAL_L      = 5
 GRAPH_D         = 2
 DROPOUT         = 0.30
 ATTENTION_RRD   = 4
-SPINE_JOINT     = 20
+
+# Anatomical reference joints for spine-length normalization.
+# Joint 0  = pelvis / base of spine.
+# Joint 20 = spine mid / neck.
+SPINE_BASE_JOINT = 0
+SPINE_TOP_JOINT  = 20
 
 # NTU 25-joint bone pairs (0-based) — for bone feature generation
 NTU_JOINT_PAIRS = [
@@ -390,13 +382,13 @@ class EfficientGCN_B0(nn.Module):
         act = Swish()
         A   = torch.stack(GRAPH.adj_matrices, dim=0)
 
-        # CHANGED: InitialBlock input channels updated for 3D feature streams.
+        # CHANGED: InitialBlock input channels updated for 15-channel layout.
         #   init_joint    : 6 ch  (abs_x, abs_y, abs_z, rel_x, rel_y, rel_z)
         #   init_velocity : 6 ch  (fast_x, fast_y, fast_z, slow_x, slow_y, slow_z)
-        #   init_bone     : 4 ch  (bone_dx, bone_dy, bone_dz, bone_len)
-        self.init_joint    = InitialBlock(6,  64, A=A, act=act)
-        self.init_velocity = InitialBlock(6,  64, A=A, act=act)
-        self.init_bone     = InitialBlock(4,  64, A=A, act=act)
+        #   init_bone     : 3 ch  (bone_dx, bone_dy, bone_dz)  ← was 4; bone_len removed
+        self.init_joint    = InitialBlock(6, 64, A=A, act=act)
+        self.init_velocity = InitialBlock(6, 64, A=A, act=act)
+        self.init_bone     = InitialBlock(3, 64, A=A, act=act)   # ← 3, not 4
 
         self.stage1_joint    = GCNBlock(64, 48, A=A, depth=0, act=act)
         self.stage1_velocity = GCNBlock(64, 48, A=A, depth=0, act=act)
@@ -430,10 +422,10 @@ class EfficientGCN_B0(nn.Module):
 
     def forward(self, joint, velocity, bone):
         """
-        CHANGED: channel dimensions updated for 3D streams.
+        CHANGED: channel dimensions updated for 15-channel layout.
         joint:    [N, 6, T, V, M]   (abs_xyz + rel_xyz)
         velocity: [N, 6, T, V, M]   (fast_xyz + slow_xyz)
-        bone:     [N, 4, T, V, M]   (bone_dx, bone_dy, bone_dz, bone_len)
+        bone:     [N, 3, T, V, M]   (bone_dx, bone_dy, bone_dz)  ← bone_len removed
         """
         N = joint.shape[0]
 
@@ -469,14 +461,14 @@ class EfficientGCN_B0(nn.Module):
         return self.fc(x)
 
 
-print("✓ EfficientGCN-B0 (3D) architecture defined")
+print("✓ EfficientGCN-B0 (3D, 15-channel) architecture defined")
 
 
 # ============================================================================
 # CELL 4: Load Action Recognition Model
 # ============================================================================
 
-ACTION_MODEL_PATH = 'best_efficientgcn_b0_media_3d_81.pth'   # <-- update path if needed
+ACTION_MODEL_PATH = 'best_efficientgcn_b0 (2).pth'   # <-- update path if needed
 
 def load_action_model(ckpt_path):
     model = EfficientGCN_B0(num_classes=NUM_CLASSES).to(device)
@@ -485,10 +477,8 @@ def load_action_model(ckpt_path):
         print(f"WARNING: Checkpoint not found at {ckpt_path}. Model weights NOT loaded.")
         return model
 
-    # Load the checkpoint dictionary
     ckpt = torch.load(ckpt_path, map_location=device)
 
-    # FIX: Extract the actual weights from the 'state_dict' key
     if isinstance(ckpt, dict) and 'state_dict' in ckpt:
         state = ckpt['state_dict']
         epoch = ckpt.get('epoch', 'unknown')
@@ -498,18 +488,16 @@ def load_action_model(ckpt_path):
         state = ckpt
         print("✓ Loading raw state_dict")
 
-    # Handle weights saved with DataParallel (removes 'module.' prefix if it exists)
     from collections import OrderedDict
     new_state_dict = OrderedDict()
     for k, v in state.items():
         name = k[7:] if k.startswith('module.') else k
         new_state_dict[name] = v
 
-    # Load the cleaned state dict into the model
     model.load_state_dict(new_state_dict, strict=True)
     model.eval()
 
-    print(f"✓ EfficientGCN-B0 (3D) weights loaded successfully from {ckpt_path}")
+    print(f"✓ EfficientGCN-B0 (3D, 15-ch) weights loaded successfully from {ckpt_path}")
     return model
 
 action_model = load_action_model(ACTION_MODEL_PATH)
@@ -617,35 +605,33 @@ print("✓ BBox expansion utilities defined")
 
 
 # ============================================================================
-# CELL 7: Skeleton Keypoint Mapping & Buffer (3D Upgrade)
+# CELL 7: Skeleton Keypoint Mapping & Buffer (3D, 15-channel)
 # ============================================================================
 """
-CHANGED (3D upgrade):
-
-  mediapipe_to_ntu25:
-    - Now returns [25, 3] instead of [25, 2].
-    - All midpoint calculations (spine, neck, pelvis) compute the mean across
-      X, Y, AND Z axes.
-    - snap_missing_to_spine copies the 3D spine coordinates (X, Y, Z) to any
-      joint that remained at (0, 0, 0) after mapping.
-    - The detected-joint check is updated to test any of (x, y, z) non-zero.
+CHANGED (15-channel alignment):
 
   generate_features_from_sequence:
-    - Now accepts seq of shape [T, 25, 3].
-    - Joint stream  (6 ch): abs_x, abs_y, abs_z  +  rel_x, rel_y, rel_z.
-    - Velocity stream (6 ch): fast_x, fast_y, fast_z  +  slow_x, slow_y, slow_z.
-    - Bone stream (4 ch): bone_dx, bone_dy, bone_dz  +  bone_len (3D Euclidean
-      length: sqrt(dx^2 + dy^2 + dz^2)). The 2D bone_angle channel is removed.
-    - Output shape: [16, T, 25, 1].
+    - Normalization replaced: max-abs scaling removed and replaced with
+      spine-length normalization. The mean 3D distance between
+      SPINE_BASE_JOINT (0) and SPINE_TOP_JOINT (20) across all frames is
+      used as the normalization scalar. This scalar is camera-angle-invariant
+      because both joints scale equally when the person moves toward or away
+      from the camera. Falls back to max-abs only if spine length is 0.
+    - Bone stream: bone_len REMOVED. The bone stream now returns only
+      bone_dx, bone_dy, bone_dz (3 channels). bone_len is excluded because
+      MediaPipe's Z-axis is scaled by the 2D bounding box width, making bone
+      lengths vary artificially with camera distance rather than actual motion.
+    - Output shape changes from [16, T, 25, 1] to [15, T, 25, 1].
+    - Total channels: 6 (joint) + 6 (velocity) + 3 (bone) = 15.
 
-  SkeletonBuffer:
-    - Internal shapes updated from [25, 2] to [25, 3] and 11-ch to 16-ch.
-    - All buffer logic and public API remain identical.
+  SkeletonBuffer.get_tensor:
+    - Padding block now uses 15 channels (was 16).
+    - Output tensor shape is now [1, 15, T, V, M].
+
+  mediapipe_to_ntu25: UNCHANGED.
 """
 
 # ---- MediaPipe 33-landmark index → NTU 25-joint index ----
-# Only the landmarks that have a clear anatomical correspondence are mapped.
-# Unmapped NTU joints are approximated or snapped to spine (see function below).
 MP_TO_NTU = {
     0:  3,   # nose          → head
     11: 4,   # left shoulder → NTU left shoulder
@@ -691,57 +677,43 @@ def mediapipe_to_ntu25(landmarks, snap_missing_to_spine=False):
     Returns
     -------
     joints : np.ndarray, shape [25, 3]
-        NTU-25 joint positions (x, y, z).  x and y are in pixel space.
-        z is in the same scale as x (pixels, proportional to crop width).
-        Downstream normalization is handled by generate_features_from_sequence.
+        NTU-25 joint positions (x, y, z).
     """
-    # CHANGED: array is now [25, 3] to hold (x, y, z).
     joints = np.zeros((NUM_JOINTS, 3), dtype=np.float32)
 
     # Step 1: Direct mapping from MediaPipe landmarks to NTU joints.
     for mp_idx, ntu_idx in MP_TO_NTU.items():
         if mp_idx < len(landmarks):
-            joints[ntu_idx] = landmarks[mp_idx]   # copies all 3 coords
+            joints[ntu_idx] = landmarks[mp_idx]
 
     # Step 2: Compute NTU spine (joint 20) as midpoint of shoulders and hips.
-    # CHANGED: non-zero check tests any axis to handle cases where only z is 0.
     left_sh   = joints[4]    # NTU left shoulder  (MP 11)
     right_sh  = joints[8]    # NTU right shoulder (MP 12)
     left_hip  = joints[12]   # NTU left hip       (MP 23)
     right_hip = joints[16]   # NTU right hip      (MP 24)
 
-    # A joint is "detected" if any of its three coordinates is non-zero.
     def _detected(p):
         return p[0] != 0 or p[1] != 0 or p[2] != 0
 
     shoulder_pts = [p for p in [left_sh, right_sh] if _detected(p)]
     hip_pts      = [p for p in [left_hip, right_hip] if _detected(p)]
 
-    # CHANGED: np.mean now averages across all 3 axes simultaneously because
-    # each element p is [x, y, z].
     if shoulder_pts and hip_pts:
-        mid_sh  = np.mean(shoulder_pts, axis=0)   # [3]
-        mid_hip = np.mean(hip_pts, axis=0)         # [3]
-        joints[20] = (mid_sh + mid_hip) / 2.0      # spine midpoint in 3D
+        mid_sh  = np.mean(shoulder_pts, axis=0)
+        mid_hip = np.mean(hip_pts, axis=0)
+        joints[20] = (mid_sh + mid_hip) / 2.0
     elif shoulder_pts:
         joints[20] = np.mean(shoulder_pts, axis=0)
     elif hip_pts:
         joints[20] = np.mean(hip_pts, axis=0)
-    # else: spine stays (0,0,0) — handled by snap below if requested
 
-    spine = joints[20].copy()   # [3]
+    spine = joints[20].copy()
 
     # Step 3: Approximate NTU joints with no direct MediaPipe equivalent.
-    #   NTU 0  — pelvis/base of spine  → midpoint of hips
-    #   NTU 1  — mid-spine             → midpoint of spine (joint 20) and pelvis (joint 0)
-    #   NTU 2  — neck / chest top      → midpoint of shoulders
-    #
-    # CHANGED: All mean() and midpoint calculations naturally extend to 3D
-    # because the arrays are now [3]-vectors.
     if hip_pts:
         joints[0] = np.mean(hip_pts, axis=0)
     elif _detected(joints[20]):
-        joints[0] = joints[20]   # fallback
+        joints[0] = joints[20]
 
     if _detected(joints[0]) and _detected(joints[20]):
         joints[1] = (joints[0] + joints[20]) / 2.0
@@ -754,24 +726,21 @@ def mediapipe_to_ntu25(landmarks, snap_missing_to_spine=False):
         joints[2] = joints[20]
 
     # Step 4: Mirror wrist joints to NTU hand joints.
-    #   NTU 7  → left hand  (mirrors left wrist, NTU 6)
-    #   NTU 11 → right hand (mirrors right wrist, NTU 10)
-    joints[7]  = joints[6]    # left hand  = left wrist  (copies xyz)
-    joints[11] = joints[10]   # right hand = right wrist (copies xyz)
+    joints[7]  = joints[6]
+    joints[11] = joints[10]
 
-    # Step 5: Snap undetected joints (still at (0,0,0)) to spine if requested.
-    # CHANGED: check uses _detected() to test all three axes.
+    # Step 5: Snap undetected joints to spine if requested.
     if snap_missing_to_spine:
         for i in range(NUM_JOINTS):
             if not _detected(joints[i]):
                 joints[i] = spine
 
-    return joints   # [25, 3] — pixel space x, y; scaled-pixel z
+    return joints   # [25, 3]
 
 
 def generate_features_from_sequence(seq):
     """
-    Generate the 16-channel EfficientGCN feature array from a raw 3D
+    Generate the 15-channel EfficientGCN feature array from a raw 3D
     skeleton sequence.
 
     Parameters
@@ -781,95 +750,110 @@ def generate_features_from_sequence(seq):
 
     Returns
     -------
-    sample : np.ndarray, shape [16, T, 25, 1]
+    sample : np.ndarray, shape [15, T, 25, 1]
         Feature tensor split as:
           ch  0- 5  : joint stream    (abs_x, abs_y, abs_z,
                                        rel_x, rel_y, rel_z)        [6 ch]
           ch  6-11  : velocity stream (fast_x, fast_y, fast_z,
                                        slow_x, slow_y, slow_z)     [6 ch]
-          ch 12-15  : bone stream     (bone_dx, bone_dy, bone_dz,
-                                       bone_len)                   [4 ch]
-        Total = 6 + 6 + 4 = 16 channels.
+          ch 12-14  : bone stream     (bone_dx, bone_dy, bone_dz)  [3 ch]
+        Total = 6 + 6 + 3 = 15 channels.
 
-    CHANGED (3D upgrade):
-      - seq is now [T, 25, 3] instead of [T, 25, 2].
-      - Spine-centering and max-abs normalisation operate on all 3 axes.
-      - Joint stream:    abs + spine-relative for x, y, z  → 6 ch.
-      - Velocity stream: fast + slow for x, y, z           → 6 ch.
-      - Bone stream:     dx, dy, dz + 3D length            → 4 ch.
-        The 2D bone_angle channel is replaced by 3D bone_len =
-        sqrt(dx^2 + dy^2 + dz^2), which is more meaningful in 3D space.
+    CHANGED (15-channel alignment):
+      Normalization:
+        The original max-abs scaling is replaced with spine-length
+        normalization matching the training script. The mean 3D Euclidean
+        distance between SPINE_BASE_JOINT (0) and SPINE_TOP_JOINT (20)
+        across all tracked frames is used as the normalization scalar.
+        This scalar is invariant to camera distance because both reference
+        joints scale identically as the person moves toward the camera.
+        Fallback to max-abs scaling is used only if the spine length is 0.
+
+      Bone stream:
+        bone_len removed entirely. The bone stream now contains only
+        bone_dx, bone_dy, bone_dz (3 channels instead of 4).
+        Reason: MediaPipe estimates Z by scaling proportionally to the 2D
+        bounding box width. As the person moves toward the camera, the
+        bounding box grows and all bone lengths artificially increase even
+        though the actual bones have not changed. Including bone_len would
+        teach the model to use camera distance as a feature — a noise source
+        that does not generalize to the real world.
     """
     T, V, C = seq.shape   # C = 3
 
-    # Transpose to [C, T, V]  →  [3, T, 25]
+    # Transpose to [C, T, V] → [3, T, 25]
     data = seq.transpose(2, 0, 1)
 
-    # ── Normalise: centre at spine joint ──────────────────────────────────
-    # spine shape: [3, T, 1]  →  broadcast-subtracts across all V joints
-    spine = data[:, :, SPINE_JOINT:SPINE_JOINT+1]   # [3, T, 1]
-    data_rel = data - spine
-    scale = np.abs(data_rel).max()
-    if scale > 1e-6:
-        data_rel = data_rel / scale
-    data = data_rel   # [3, T, V]
+    # ── Normalise: centre at SPINE_BASE_JOINT (joint 0) ──────────────────
+    spine_base = data[:, :, SPINE_BASE_JOINT:SPINE_BASE_JOINT + 1]   # [3, T, 1]
+    data_centred = data - spine_base                                   # [3, T, V]
+
+    # ── Spine-length normalization ────────────────────────────────────────
+    # Compute the 3D position of SPINE_TOP_JOINT (joint 20) in the centred
+    # skeleton. After centring on joint 0, joint 0 is at the origin, so the
+    # spine vector equals the centred position of joint 20.
+    spine_top_vec = data_centred[:, :, SPINE_TOP_JOINT]    # [3, T]
+
+    # Per-frame Euclidean spine length
+    spine_len_per_frame = np.sqrt((spine_top_vec ** 2).sum(axis=0))   # [T]
+
+    # Mean over frames where the joint is actually tracked
+    nonzero_mask = spine_len_per_frame > 1e-6
+    if nonzero_mask.any():
+        spine_length = spine_len_per_frame[nonzero_mask].mean()
+    else:
+        spine_length = 0.0
+
+    if spine_length > 1e-6:
+        data_norm = data_centred / spine_length
+    else:
+        # Fallback: max-abs scaling if spine length collapses
+        scale = np.abs(data_centred).max()
+        data_norm = data_centred / scale if scale > 1e-6 else data_centred
+
+    data = data_norm   # [3, T, V]
 
     # Add M dimension: [3, T, V, 1]
     data = data[:, :, :, np.newaxis]
 
     # ── Joint features  (6 channels) ──────────────────────────────────────
-    # absolute: the normalised xyz coords as-is
-    # relative: subtract the (already-centred) spine to get joint-to-spine
-    #           offsets. Since data is already spine-centred, spine column is
-    #           near zero but recalculating keeps the pipeline numerically
-    #           consistent with training.
-    absolute = data.copy()                                    # [3, T, V, 1]
-    spine4   = data[:, :, SPINE_JOINT:SPINE_JOINT+1, :]      # [3, T, 1, 1]
-    relative = data - spine4                                  # [3, T, V, 1]
-    joint    = np.concatenate([absolute, relative], axis=0)  # [6, T, V, 1]
+    absolute = data.copy()                                                 # [3, T, V, 1]
+    spine4   = data[:, :, SPINE_BASE_JOINT:SPINE_BASE_JOINT + 1, :]       # [3, T, 1, 1]
+    relative = data - spine4                                               # [3, T, V, 1]
+    joint    = np.concatenate([absolute, relative], axis=0)               # [6, T, V, 1]
 
     # ── Velocity features  (6 channels) ───────────────────────────────────
-    # fast velocity: displacement over 2 frames  (frame[t+2] − frame[t])
-    # slow velocity: displacement over 1 frame   (frame[t+1] − frame[t])
     fast = np.zeros_like(data)   # [3, T, V, 1]
     slow = np.zeros_like(data)
     if T > 2:
         fast[:, :-2, :, :] = data[:, 2:, :, :] - data[:, :-2, :, :]
     if T > 1:
         slow[:, :-1, :, :] = data[:, 1:, :, :] - data[:, :-1, :, :]
-    velocity = np.concatenate([fast, slow], axis=0)          # [6, T, V, 1]
+    velocity = np.concatenate([fast, slow], axis=0)                       # [6, T, V, 1]
 
-    # ── Bone features  (4 channels) ───────────────────────────────────────
-    # bone_xyz: 3D delta vector from child joint to parent joint
-    # bone_len: Euclidean length of the 3D bone vector = sqrt(dx^2+dy^2+dz^2)
-    #
-    # CHANGED: bone_angle (atan2 of 2D dx/dy) is replaced by bone_len because
-    # angle is not well-defined in 3D and bone length is a better-generalising
-    # structural feature for the 3D NTU model.
-    bone_xyz = np.zeros_like(data)   # [3, T, V, 1]  — dx, dy, dz per bone
+    # ── Bone features  (3 channels) ───────────────────────────────────────
+    # bone_dx, bone_dy, bone_dz: 3D delta vector (child − parent) per joint.
+    # bone_len deliberately excluded. See docstring for reasoning.
+    bone_delta = np.zeros_like(data)   # [3, T, V, 1]
     for (i, j) in NTU_JOINT_PAIRS:
         if i < V and j < V:
-            bone_xyz[:, :, i, :] = data[:, :, i, :] - data[:, :, j, :]
+            bone_delta[:, :, i, :] = data[:, :, i, :] - data[:, :, j, :]
 
-    bone_dx  = bone_xyz[0:1, :, :, :]   # [1, T, V, 1]
-    bone_dy  = bone_xyz[1:2, :, :, :]   # [1, T, V, 1]
-    bone_dz  = bone_xyz[2:3, :, :, :]   # [1, T, V, 1]
-    # 3D Euclidean bone length — replaces the 2D bone_angle channel
-    bone_len = np.sqrt(bone_dx**2 + bone_dy**2 + bone_dz**2).astype(np.float32)
-    bone     = np.concatenate([bone_dx, bone_dy, bone_dz, bone_len], axis=0)  # [4, T, V, 1]
+    bone = bone_delta   # [3, T, V, 1]
 
-    # total channels = 6 + 6 + 4 = 16
-    sample = np.concatenate([joint, velocity, bone], axis=0)   # [16, T, V, 1]
+    # total channels = 6 + 6 + 3 = 15
+    sample = np.concatenate([joint, velocity, bone], axis=0)   # [15, T, V, 1]
     return sample.astype(np.float32)
 
 
 class SkeletonBuffer:
     """
-    CHANGED (3D upgrade):
-      - push() / push_pair() now expect joints arrays of shape [25, 3].
-      - get_tensor() builds [1, 16, T, V, M] tensors (was [1, 11, T, V, M]).
-      - The padding block uses 16 channels (was 11).
-      - All other buffer logic, ready(), prune(), remove() are unchanged.
+    Rolling per-track skeleton buffer.
+
+    CHANGED (15-channel alignment):
+      - get_tensor() builds [1, 15, T, V, M] tensors (was [1, 16, T, V, M]).
+      - The padding block uses 15 channels (was 16).
+      - push() / push_pair() and all other buffer logic are unchanged.
     """
     def __init__(self, buffer_len=MAX_FRAMES):
         self.buffer_len = buffer_len
@@ -898,32 +882,32 @@ class SkeletonBuffer:
 
     def get_tensor(self, key):
         """
-        Returns a (1, 16, T, V, M) float tensor ready for EfficientGCN-B0.
+        Returns a (1, 15, T, V, M) float tensor ready for EfficientGCN-B0.
         For single tracks: M=1.  For interaction pairs: M=2.
-        CHANGED: feature dim is 16 (was 11).
+        CHANGED: feature dim is 15 (was 16). Padding uses 15 channels.
         """
         frames = list(self._buffers[key])
 
         if isinstance(frames[0], tuple):
             seq_a  = np.stack([f[0] for f in frames], axis=0)    # [T, 25, 3]
             seq_b  = np.stack([f[1] for f in frames], axis=0)    # [T, 25, 3]
-            feat_a = generate_features_from_sequence(seq_a)      # [16, T, 25, 1]
-            feat_b = generate_features_from_sequence(seq_b)      # [16, T, 25, 1]
-            feat   = np.concatenate([feat_a, feat_b], axis=3)    # [16, T, 25, 2]
+            feat_a = generate_features_from_sequence(seq_a)      # [15, T, 25, 1]
+            feat_b = generate_features_from_sequence(seq_b)      # [15, T, 25, 1]
+            feat   = np.concatenate([feat_a, feat_b], axis=3)    # [15, T, 25, 2]
         else:
             seq  = np.stack(frames, axis=0)                       # [T, 25, 3]
-            feat = generate_features_from_sequence(seq)           # [16, T, 25, 1]
+            feat = generate_features_from_sequence(seq)           # [15, T, 25, 1]
 
         T_actual = feat.shape[1]
-        # CHANGED: padding uses 16 channels
+        # CHANGED: padding uses 15 channels (was 16)
         if T_actual < MAX_FRAMES:
-            pad  = np.zeros((16, MAX_FRAMES - T_actual, NUM_JOINTS, feat.shape[3]),
+            pad  = np.zeros((15, MAX_FRAMES - T_actual, NUM_JOINTS, feat.shape[3]),
                             dtype=np.float32)
             feat = np.concatenate([feat, pad], axis=1)
         elif T_actual > MAX_FRAMES:
             feat = feat[:, :MAX_FRAMES, :, :]
 
-        tensor = torch.from_numpy(feat).unsqueeze(0)   # [1, 16, T, V, M]
+        tensor = torch.from_numpy(feat).unsqueeze(0)   # [1, 15, T, V, M]
         return tensor
 
     def remove(self, key):
@@ -935,42 +919,42 @@ class SkeletonBuffer:
             del self._buffers[k]
 
 
-print("✓ MediaPipe 3D mapping and SkeletonBuffer defined")
+print("✓ MediaPipe 3D mapping and SkeletonBuffer (15-ch) defined")
 
 
 # ============================================================================
 # CELL 8: Action Inference Helper
 # ============================================================================
 """
-CHANGED (3D upgrade):
-  split_sample slices the 16-channel tensor into the three 3D feature streams:
+CHANGED (15-channel alignment):
+  split_sample slices the 15-channel tensor into the three 3D feature streams:
     joint    = tensor[:, 0:6]    (abs_xyz + rel_xyz)
     velocity = tensor[:, 6:12]   (fast_xyz + slow_xyz)
-    bone     = tensor[:, 12:16]  (bone_dx, bone_dy, bone_dz, bone_len)
+    bone     = tensor[:, 12:15]  (bone_dx, bone_dy, bone_dz)  ← was 12:16
 
   All other inference logic (temperature scaling, top-5, PredictionCache)
   is unchanged.
 """
 
 CONFIDENCE_THRESHOLD = 0.10
-SOFTMAX_TEMP         = 1.0
+SOFTMAX_TEMP         = 1.2
 
 
 def split_sample(tensor):
     """
-    Split [N, 16, T, V, M] into the three feature streams.
-    CHANGED: slicing indices updated from 11-ch (4/4/3) to 16-ch (6/6/4).
+    Split [N, 15, T, V, M] into the three feature streams.
+    CHANGED: slicing indices updated from 16-ch (6/6/4) to 15-ch (6/6/3).
       joint    : tensor[:, 0:6]
       velocity : tensor[:, 6:12]
-      bone     : tensor[:, 12:16]
+      bone     : tensor[:, 12:15]   ← was 12:16
     """
-    return tensor[:, 0:6], tensor[:, 6:12], tensor[:, 12:16]
+    return tensor[:, 0:6], tensor[:, 6:12], tensor[:, 12:15]
 
 
 @torch.no_grad()
 def run_action_inference(tensor):
     """
-    tensor : (1, 16, T, V, M) on CPU — output of SkeletonBuffer.get_tensor()
+    tensor : (1, 15, T, V, M) on CPU — output of SkeletonBuffer.get_tensor()
     Returns (class_code_str, readable_label, confidence_float)
     """
     tensor = tensor.to(device)
@@ -1032,23 +1016,15 @@ class PredictionCache:
                 del self._cache[k]
 
 
-print("✓ Action inference helpers (3D) defined")
+print("✓ Action inference helpers (15-ch) defined")
 
 
 # ============================================================================
 # CELL 9: Complete Visualization Utilities (with Skeleton & ID Color)
 # ============================================================================
-"""
-UNCHANGED in behaviour.
-draw_skeleton operates entirely in 2D — it reads only the first two
-coordinates of each joint (index 0 = x, index 1 = y) and ignores Z.
-This is correct and intentional: OpenCV draws on a 2D image plane.
-
-CHANGED: kpts_ntu is now shape [25, 3], so joint access uses explicit
-integer indexing kpts_ntu[i][0] and kpts_ntu[i][1] to extract x and y.
-The Z component (kpts_ntu[i][2]) is deliberately not used here.
-The (0, 0) visibility guard is also applied only on x and y.
-"""
+# UNCHANGED in behaviour.
+# draw_skeleton operates entirely in 2D — reads only index 0 (x) and 1 (y),
+# ignores Z. kpts_ntu is shape [25, 3].
 
 _PALETTE = [
     (0,255,0),(0,128,255),(255,0,128),(255,255,0),(0,255,255),
@@ -1056,33 +1032,28 @@ _PALETTE = [
 ]
 
 def _id_color(track_id):
-    """Returns a consistent BGR color for a given track ID."""
     return _PALETTE[track_id % len(_PALETTE)]
 
 def draw_skeleton(frame, kpts_ntu, color):
     """
     Draws the NTU-25 skeleton structure on the frame using only (x, y).
-
     kpts_ntu : np.ndarray [25, 3]  — pixel-space x, y, z per joint.
-    The Z-axis is ignored for all OpenCV drawing operations.
+    Z is ignored for all OpenCV drawing operations.
     """
     connections = [
-        (0, 1), (1, 20), (20, 2), (2, 3),                    # Spine & Head
-        (20, 4), (4, 5), (5, 6), (6, 7), (6, 21), (6, 22),   # Left Arm
-        (20, 8), (8, 9), (9, 10), (10, 11), (10, 23), (10, 24), # Right Arm
-        (0, 12), (12, 13), (13, 14), (14, 15),                # Left Leg
-        (0, 16), (16, 17), (17, 18), (18, 19)                 # Right Leg
+        (0, 1), (1, 20), (20, 2), (2, 3),
+        (20, 4), (4, 5), (5, 6), (6, 7), (6, 21), (6, 22),
+        (20, 8), (8, 9), (9, 10), (10, 11), (10, 23), (10, 24),
+        (0, 12), (12, 13), (13, 14), (14, 15),
+        (0, 16), (16, 17), (17, 18), (18, 19)
     ]
 
     for i in range(len(kpts_ntu)):
-        # CHANGED: explicitly index [0] and [1] — do NOT use tuple(kpts_ntu[i])
-        # because that would pass 3 values to a 2D OpenCV function.
         x, y = int(kpts_ntu[i][0]), int(kpts_ntu[i][1])
         if x > 0 or y > 0:
             cv2.circle(frame, (x, y), 3, (255, 255, 255), -1)
 
     for start_idx, end_idx in connections:
-        # Extract only x, y for drawing — Z is ignored.
         pt1 = (int(kpts_ntu[start_idx][0]), int(kpts_ntu[start_idx][1]))
         pt2 = (int(kpts_ntu[end_idx][0]),   int(kpts_ntu[end_idx][1]))
         if pt1 != (0, 0) and pt2 != (0, 0):
@@ -1137,41 +1108,16 @@ print("✓ Visualization utilities defined")
 # ============================================================================
 # CELL 10: Full Video Processing Pipeline (MediaPipe 3D Edition)
 # ============================================================================
-"""
-CHANGED (3D upgrade — Z-axis extraction and scaling):
+# UNCHANGED from the 3D upgrade version.
+# Z-coordinate extraction: lm.z * crop_w (scales to same pixel units as x, y).
+# Z does NOT receive a bounding-box offset because depth is not an image-plane
+# coordinate — adding x1 to z would be physically meaningless.
 
-  1. kpts_px is now shape [33, 3] (was [33, 2]) to hold (x, y, z) per landmark.
-
-  2. Z-coordinate extraction:
-       lm_z = landmark.z * crop_w
-
-     MediaPipe's landmark.z is the depth relative to the hip midpoint, expressed
-     as a fraction of the person's height.  However, MediaPipe normalises it
-     proportionally to the crop width, so multiplying by crop_w converts it to
-     the same pixel-scale as lm_x and lm_y.  This is consistent with how NTU
-     RGB+D depth values are provided relative to the sensor and ensures the
-     bone_len features computed downstream have numerically meaningful magnitudes.
-
-  3. Offset application:
-     - lm_x += x1 and lm_y += y1 are applied ONLY when the joint was detected
-       (same bug-fix logic as the 2D version).
-     - lm_z does NOT receive any bounding-box offset because Z is a depth value,
-       not a 2D image-plane coordinate.  Adding x1 to z would be physically
-       meaningless and would corrupt the depth channel.
-
-  4. kpts_px[lm_idx] = [lm_x, lm_y, lm_z]  — all three coords stored.
-
-  5. Zero/fallback arrays for undetected persons are now shape [25, 3].
-
-  All detection, tracking, interaction, buffer, inference, and visualization
-  steps are otherwise UNCHANGED.
-"""
 import math
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# --- STABILIZATION UTILITY ---
 class OneEuroFilter:
     def __init__(self, freq, mincutoff=1.0, beta=0.0, dcutoff=1.0):
         self.freq = freq
@@ -1204,9 +1150,9 @@ def process_video_with_action_recognition(
     video_path,
     output_path       = 'output_action.mp4',
     reid_model_path   = 'best_model.pth',
-    conf_threshold    = 0.3,         # Lowered for better detection
+    conf_threshold    = 0.3,
     max_frames        = None,
-    buffer_len        = 120,         # Matches training logs
+    buffer_len        = 120,
     bbox_scale        = 1.5,
     iou_thresh        = 0.20,
     dist_thresh       = 150,
@@ -1222,7 +1168,6 @@ def process_video_with_action_recognition(
     tot_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if max_frames: tot_frames = min(tot_frames, max_frames)
 
-    # ---- Initialization ----
     base_options = python.BaseOptions(model_asset_path='pose_landmarker_heavy.task')
     options = vision.PoseLandmarkerOptions(base_options=base_options, running_mode=vision.RunningMode.IMAGE)
     pose_landmarker = vision.PoseLandmarker.create_from_options(options)
@@ -1234,14 +1179,11 @@ def process_video_with_action_recognition(
 
     skeleton_buffer = SkeletonBuffer(buffer_len=buffer_len)
     pred_cache = PredictionCache(max_age=buffer_len)
-    pose_filters = {} # Store OneEuro filters per track ID
+    pose_filters = {}
 
     out_writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
     top5_action_log = defaultdict(lambda: defaultdict(float))
 
-    # ---- Instantiate JSON action logger ----
-    # ActionEventLogger is defined in Cell 10.5 (after this function in the file).
-    # Python resolves it at call-time, not at function-definition time, so this works.
     action_logger = ActionEventLogger(
         video_path        = video_path,
         output_video_path = output_path,
@@ -1258,16 +1200,13 @@ def process_video_with_action_recognition(
         ret, frame = cap.read()
         if not ret or (max_frames and frame_idx >= max_frames): break
 
-        # Step 1: Detection
         results = detector(frame, verbose=False)[0]
         detections = [[*box.xyxy[0].cpu().numpy(), float(box.conf[0])]
                       for box in results.boxes if int(box.cls[0]) == 0 and float(box.conf[0]) > conf_threshold]
 
-        # Step 2: Tracking (Handling NumPy array output)
         raw_tracks = tracker.update(frame, np.array(detections) if detections else np.empty((0, 5)))
         tracks_dict = {int(t[4]): t[:4].tolist() for t in raw_tracks} if len(raw_tracks) > 0 else {}
 
-        # Step 3: Interaction & Skeleton Extraction
         active_pairs = interaction_detector.update(tracks_dict)
         track_kpts_norm, track_kpts_pix = {}, {}
 
@@ -1285,16 +1224,13 @@ def process_video_with_action_recognition(
                     for i, lm in enumerate(landmarks):
                         kpts_px[i] = [lm.x * c_w + ex1, lm.y * c_h + ey1, lm.z * c_w]
 
-                    # --- STABILIZATION ---
                     if tid not in pose_filters:
-                        pose_filters[tid] = OneEuroFilter(freq=fps, mincutoff=0.5, beta=0.01)
+                        pose_filters[tid] = OneEuroFilter(freq=fps, mincutoff=0.3, beta=0.01)
                     kpts_px = pose_filters[tid](kpts_px)
-                    # ---------------------
 
-                    track_kpts_pix[tid] = mediapipe_to_ntu25(kpts_px, snap_missing_to_spine=False)
+                    track_kpts_pix[tid]  = mediapipe_to_ntu25(kpts_px, snap_missing_to_spine=False)
                     track_kpts_norm[tid] = mediapipe_to_ntu25(kpts_px, snap_missing_to_spine=True)
 
-        # Step 4: Buffer & Inference
         for tid, ntu25 in track_kpts_norm.items(): skeleton_buffer.push(tid, ntu25)
         for pair in active_pairs:
             if all(p in track_kpts_norm for p in pair):
@@ -1318,12 +1254,10 @@ def process_video_with_action_recognition(
                 cached = pred_cache.get(key)
                 if cached: action_labels[key] = cached
 
-        # Step 5: Visuals
         vis_frame = draw_action_overlays(frame, tracks_dict, action_labels, active_pairs, track_keypoints=track_kpts_pix)
         vis_frame = draw_trajectories(vis_frame, tracker)
         out_writer.write(vis_frame)
 
-        # Step 6: JSON logging — record state ONLY once per second
         if fps > 0 and frame_idx % fps == 0:
             action_logger.log_event(
                 frame_idx       = frame_idx,
@@ -1339,7 +1273,6 @@ def process_video_with_action_recognition(
 
     cap.release(); out_writer.release(); pose_landmarker.close()
 
-    # Save JSON log
     json_path = os.path.splitext(output_path)[0] + '_action_log.json'
     action_logger.save(json_path)
     print(f"✓ Action log saved → {json_path}")
@@ -1353,86 +1286,29 @@ print("✓ Video processing pipeline defined")
 # ============================================================================
 # CELL 10.5: Action Event Logger — JSON Storage Module
 # ============================================================================
-"""
-Records every recognised action, frame metadata, interaction distances / IoU,
-and caregiver-patient role context into a structured JSON file.
-
-45 action classes are divided into four categories:
-  - patient_specific    : actions typically performed BY a patient
-  - caregiver_specific  : actions typically performed BY a caregiver
-  - interaction_based   : two-person interaction actions
-  - common              : actions that may be performed by either role
-
-The logger is instantiated inside process_video_with_action_recognition and
-called once per frame (log_event) and once at the end (save).
-No existing inference, tracking, or skeleton logic is modified.
-"""
+# UNCHANGED.
 
 import json
 import datetime
 
-# ---- Action category taxonomy (45 classes) ----
 ACTION_CATEGORIES = {
-    # Actions that a patient/care-receiver would typically perform
     'patient_specific': [
-        'A001',  # drink water
-        'A002',  # eat meal
-        'A003',  # brush teeth
-        'A011',  # reading
-        'A012',  # writing
-        'A018',  # put on glasses
-        'A019',  # take off glasses
-        'A027',  # jump up
-        'A041',  # sneeze/cough
-        'A042',  # staggering
-        'A043',  # falling down
-        'A044',  # headache
-        'A045',  # chest pain
-        'A046',  # back pain
-        'A047',  # neck pain
-        'A048',  # nausea/vomiting
-        'A049',  # fan self
-        'A080',  # squat down
-        'A085',  # apply cream on face
-        'A086',  # apply cream on hand
-        'A089',  # put object into bag
-        'A090',  # take object out of bag
-        'A091',  # open a box
-        'A092',  # move heavy objects
-        'A103',  # yawn
+        'A001', 'A002', 'A003', 'A011', 'A012', 'A018', 'A019', 'A027',
+        'A041', 'A042', 'A043', 'A044', 'A045', 'A046', 'A047', 'A048',
+        'A049', 'A080', 'A085', 'A086', 'A089', 'A090', 'A091', 'A092', 'A103',
     ],
-    # Actions that a caregiver would typically perform
     'caregiver_specific': [
-        'A053',  # pat on back
-        'A056',  # giving object
-        'A114',  # carry object
-        'A116',  # follow
-        'A119',  # support somebody
+        'A053', 'A056', 'A114', 'A116', 'A119',
     ],
-    # Two-person interaction actions (usually require both persons present)
     'interaction_based': [
-        'A028',  # phone call
-        'A050',  # punch/slap
-        'A055',  # hugging
-        'A058',  # shaking hands
-        'A059',  # walking towards
-        'A060',  # walking apart
-        'A106',  # hit with object
-        'A107',  # wield knife
-        'A108',  # knock over
-        'A109',  # grab stuff
+        'A028', 'A050', 'A055', 'A058', 'A059', 'A060',
+        'A106', 'A107', 'A108', 'A109',
     ],
-    # Common actions — can be performed by either role
     'common': [
-        'A005',  # drop
-        'A006',  # pick up
-        'A008',  # sit down
-        'A009',  # stand up
-        'A054',  # point finger
+        'A005', 'A006', 'A008', 'A009', 'A054',
     ],
 }
 
-# Reverse look-up: class_code → category name
 _CODE_TO_CATEGORY = {
     code: cat
     for cat, codes in ACTION_CATEGORIES.items()
@@ -1441,19 +1317,6 @@ _CODE_TO_CATEGORY = {
 
 
 class ActionEventLogger:
-    """
-    Incrementally builds a structured JSON action log for a processed video.
-
-    Usage (inside process_video_with_action_recognition):
-        logger = ActionEventLogger(video_path, output_path, fps,
-                                   width, height, device)
-        # --- per frame ---
-        logger.log_event(frame_idx, fps, tracks_dict, action_labels,
-                         active_pairs, track_kpts_norm)
-        # --- at end ---
-        logger.save('output_action_log.json')
-    """
-
     def __init__(self, video_path, output_video_path, fps, width, height, device_str):
         self.video_path        = video_path
         self.output_video_path = output_video_path
@@ -1463,95 +1326,52 @@ class ActionEventLogger:
         self.device_str        = str(device_str)
         self.processed_at      = datetime.datetime.now().isoformat(timespec='seconds')
 
-        self._frames         = []        # list of per-frame records
-        self._all_track_ids  = set()     # for summary
-        self._recognition_count = 0      # total successful recognitions
-        self._action_distribution = defaultdict(int)  # label → count
+        self._frames              = []
+        self._all_track_ids       = set()
+        self._recognition_count   = 0
+        self._action_distribution = defaultdict(int)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def log_event(
-        self,
-        frame_idx,
-        fps,
-        tracks_dict,
-        action_labels,
-        active_pairs,
-        track_kpts_norm,
-    ):
-        """
-        Record one frame's state.
-
-        Parameters
-        ----------
-        frame_idx      : int   — current frame index
-        fps            : int   — video frames per second (for timestamp)
-        tracks_dict    : dict  — {track_id: [x1, y1, x2, y2]}
-        action_labels  : dict  — {key: (code, label, confidence)}
-                                  key is int (single track) or tuple (pair)
-        active_pairs   : set   — set of (id_a, id_b) interaction tuples
-        track_kpts_norm: dict  — {track_id: np.ndarray [25, 3]} NTU keypoints
-        """
+    def log_event(self, frame_idx, fps, tracks_dict, action_labels,
+                  active_pairs, track_kpts_norm):
         timestamp_sec = round(frame_idx / fps, 4) if fps > 0 else 0.0
 
-        # -- Tracks record -----------------------------------------------
         tracks_record = {}
         for tid, box in tracks_dict.items():
             self._all_track_ids.add(tid)
             tracks_record[str(tid)] = {
-                'bbox'                : [round(float(v), 2) for v in box],
-                'has_skeleton'        : tid in track_kpts_norm,
+                'bbox'        : [round(float(v), 2) for v in box],
+                'has_skeleton': tid in track_kpts_norm,
             }
 
-        # -- Actions record ----------------------------------------------
         actions_record = {}
         for key, (code, label, conf) in action_labels.items():
-            if code == '???':
-                category = 'uncertain'
-            else:
-                category = _CODE_TO_CATEGORY.get(code, 'unknown')
-
-            if isinstance(key, tuple):
-                record_key = f"{key[0]}-{key[1]}"
-            else:
-                record_key = str(key)
-
+            category = 'uncertain' if code == '???' else _CODE_TO_CATEGORY.get(code, 'unknown')
+            record_key = f"{key[0]}-{key[1]}" if isinstance(key, tuple) else str(key)
             actions_record[record_key] = {
                 'code'      : code,
                 'label'     : label,
                 'confidence': round(conf, 6),
                 'category'  : category,
             }
-
             if code != '???' and conf > 0:
                 self._recognition_count += 1
                 self._action_distribution[label] += 1
 
-        # -- Interactions record -----------------------------------------
         interactions_record = []
         for pair in active_pairs:
             id_a, id_b = pair
-            rec = {
-                'track_a'           : id_a,
-                'track_b'           : id_b,
-                'interaction_active': True,
-            }
+            rec = {'track_a': id_a, 'track_b': id_b, 'interaction_active': True}
             if id_a in tracks_dict and id_b in tracks_dict:
                 box_a = tracks_dict[id_a]
                 box_b = tracks_dict[id_b]
                 rec['distance_px'] = round(center_distance(box_a, box_b), 2)
                 rec['iou']         = round(compute_iou(box_a, box_b), 4)
-                # Skeleton proximity: 3D distance between spine joints (joint 20)
                 if id_a in track_kpts_norm and id_b in track_kpts_norm:
-                    sp_a = track_kpts_norm[id_a][20]   # [3]
-                    sp_b = track_kpts_norm[id_b][20]   # [3]
-                    skel_dist = float(np.linalg.norm(sp_a - sp_b))
-                    rec['skeleton_spine_distance_px'] = round(skel_dist, 2)
+                    sp_a = track_kpts_norm[id_a][20]
+                    sp_b = track_kpts_norm[id_b][20]
+                    rec['skeleton_spine_distance_px'] = round(float(np.linalg.norm(sp_a - sp_b)), 2)
             interactions_record.append(rec)
 
-        # -- Also record nearby (non-active) pairs that are close --------
         ids = list(tracks_dict.keys())
         active_set = {tuple(sorted(p)) for p in active_pairs}
         for i in range(len(ids)):
@@ -1559,10 +1379,10 @@ class ActionEventLogger:
                 id_a, id_b = ids[i], ids[j]
                 key_pair = tuple(sorted([id_a, id_b]))
                 if key_pair in active_set:
-                    continue   # already recorded above
+                    continue
                 box_a, box_b = tracks_dict[id_a], tracks_dict[id_b]
                 dist = center_distance(box_a, box_b)
-                if dist < 300:   # only log nearby non-active pairs
+                if dist < 300:
                     interactions_record.append({
                         'track_a'           : id_a,
                         'track_b'           : id_b,
@@ -1580,25 +1400,14 @@ class ActionEventLogger:
         })
 
     def save(self, output_path):
-        """
-        Write the complete action log to a JSON file.
-
-        Parameters
-        ----------
-        output_path : str — file path for the JSON output
-        """
-        # Build category-to-readable-label maps for the metadata block
         cat_readable = {}
         for cat_name, codes in ACTION_CATEGORIES.items():
             cat_readable[cat_name] = [
-                {'code': c, 'label': LABEL_NAMES.get(c, c)}
-                for c in codes
+                {'code': c, 'label': LABEL_NAMES.get(c, c)} for c in codes
             ]
 
-        # Action distribution sorted by frequency
         action_dist_sorted = dict(
-            sorted(self._action_distribution.items(),
-                   key=lambda x: x[1], reverse=True)
+            sorted(self._action_distribution.items(), key=lambda x: x[1], reverse=True)
         )
 
         payload = {
@@ -1608,7 +1417,7 @@ class ActionEventLogger:
                 'processed_at'      : self.processed_at,
                 'fps'               : self.fps,
                 'resolution'        : {'width': self.width, 'height': self.height},
-                'model'             : 'EfficientGCN-B0 (3D, NTU 45-class)',
+                'model'             : 'EfficientGCN-B0 (3D, NTU 45-class, 15-ch)',
                 'device'            : self.device_str,
                 'num_action_classes': NUM_CLASSES,
             },
@@ -1632,32 +1441,25 @@ class ActionEventLogger:
 
 print("✓ ActionEventLogger and ACTION_CATEGORIES defined")
 
+
 # ============================================================================
 # CELL 11: Run the Pipeline
 # ============================================================================
-"""
-Update the paths below and run this cell.
-All paths are now local/relative — no Google Colab /content/ prefix needed.
 
-The pipeline now also produces a JSON action log alongside the output video.
-Example JSON output path: output_action_log.json  (auto-derived from output_path)
-"""
-
-# Reset track counter before each new video
 Track._count = 0
 
 output, top5_action_log, action_logger = process_video_with_action_recognition(
-    video_path      = 'anurag.mp4',              # <-- update to your video file path
+    video_path      = 'manab.mp4',
     output_path     = 'output_action.mp4',
-    reid_model_path = 'best_model.pth',         # tracker ReID weights
+    reid_model_path = 'best_model.pth',
     conf_threshold  = 0.5,
-    max_frames      = None,        # set e.g. 300 for a quick test
-    buffer_len      = 60,          # temporal window (frames)
-    bbox_scale      = 1.5,         # expand boxes before pose crop
-    iou_thresh      = 0.20,        # interaction IoU
-    dist_thresh     = 150,         # interaction distance (px)
-    persist_frames  = 10,          # frames before interaction is "active"
-    inference_every = 4,           # run model every N frames
+    max_frames      = None,
+    buffer_len      = 90,
+    bbox_scale      = 1.5,
+    iou_thresh      = 0.20,
+    dist_thresh     = 150,
+    persist_frames  = 10,
+    inference_every = 4,
 )
 
 print(f"\n✓ Output video : {output}")
@@ -1667,13 +1469,8 @@ print(f"✓ JSON log     : {os.path.splitext(output)[0] + '_action_log.json'}")
 # ============================================================================
 # CELL 12: Preview Output
 # ============================================================================
-"""
-Open the output video with any local media player.
-The paths below point to the files produced by Cell 11.
-"""
 
 def show_video(path):
-    """Print the absolute path of the output video for easy navigation."""
     if not os.path.exists(path):
         print(f"Video not found: {path}")
         return
@@ -1687,26 +1484,12 @@ show_video('output_action.mp4')
 # ============================================================================
 # CELL 13: Top-5 Actions per Identified Person
 # ============================================================================
-"""
-Prints a ranked table of the top-5 most confidently predicted actions for
-every tracked person (and interaction pair) seen across the entire video.
-Confidence shown is the MAXIMUM value observed for that action over all
-inference calls.
-
-Also prints the action category for each entry.
-
-Run this cell AFTER CELL 11 has finished processing the video.
-"""
 
 def display_top5_actions(log):
-    """
-    log : dict  { track_id_or_pair_str -> { action_label -> max_conf } }
-    """
     if not log:
         print("No action data collected. Make sure the video was processed first.")
         return
 
-    # Build a reverse label → code map for category look-up
     _label_to_code = {v: k for k, v in LABEL_NAMES.items()}
 
     print("\n" + "=" * 74)
@@ -1744,6 +1527,4 @@ def display_top5_actions(log):
     print("=" * 74)
 
 
-# Run the display
 display_top5_actions(top5_action_log)
-
