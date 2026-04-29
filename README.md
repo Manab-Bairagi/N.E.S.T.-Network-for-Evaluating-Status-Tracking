@@ -122,7 +122,9 @@ The goal is to provide automated, unobtrusive observational intelligence in heal
  ┌────────▼────────────────────────┐
  │     RAG + LLM Query Layer       │
  │  SentenceTransformers (MiniLM)  │
- │  + Qwen 4B via Ollama           │
+ │  + Qwen 4B via Ollama  /        |
+ │    mistral:7b via Ollama /      |
+ |    qwen3.5:4b via Ollama        |
  │  → Natural language Q&A         │
  └─────────────────────────────────┘
 ```
